@@ -1,0 +1,23 @@
+{
+  "name":"800words",
+  "author": "gsmiro",
+  "version":"0.0.1",
+  "description":"Find the 800 words most used in a site",
+  "keywords": ["scrapper"],
+  "homepage":"https://github.com/gsmiro/800words",
+  "bugs":{
+    "url":"https://github.com/gsmiro/800/issues",
+    "email": "gsmiro@gmail.com"
+  },
+  "license":"MIT",
+  "dependencies":{
+    "htmlparser2":">=3.7.2",
+    "mongodb":">=1.4.7",
+    "node-schedule":">=0.1.13",
+    "mustache":">=0.8.2"
+   },
+  "repository":{
+      "url":"git@github.com:gsmiro/800words.git",
+      "type":"git"
+  }
+}
