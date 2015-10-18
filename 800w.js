@@ -2,19 +2,22 @@
 var htmlparser = require('htmlparser2');
 var fs = require('fs');
 var mongo = require('mongodb').MongoClient;
-var m = require('mustache');
 var urlp = require('url');
 var http = require('http');
 var https = require('https');
+var logger = new (require('bunyan'))({
+  name: '800w'
+});
 
 var mongourl = 'mongodb://localhost:27017/800w';
-var dict = 'abcdeèfgijklmnoòprstuvwyz';
+var abc = 'abcdeèfgijklmnoòprstuvwyz';
 
 function queue(msr,end){
   var _q = [];
   this.state = 'running'
   var _self = this;
   var _count = 0;
+  var _fail = 0;
   var _srs = msr;
   this.stop = function stop_queue(){
     _self.state = 'stopped';
@@ -27,20 +30,20 @@ function queue(msr,end){
 
   this.resume = function resume_queue(){
     _self.state = 'running';
-    run();
+
+    return run();
   }
 
   this.enqueue = function(f){
     _q.push(f);
-    console.log('enqueue '+_q.length + ' state:' + _self.state)
-    if(_self.state == 'running')run();
+    if(_self.state == 'running'){
+      return run();
+    }
   }
 
   function run(){
-    console.log('state:'+_self.state+' srs:'+_srs +' length:'+_q.length + ' count:' + _count );
     if(_self.state == 'running' && _q.length && _count < _srs){
-      console.log('Adding to queue '+ (_srs - _count));
-      var _fail = 0;
+      logger.info('state:'+_self.state+' srs:'+_srs +' length:'+_q.length + ' count:' + _count );
       for(;_count < _srs && _q.length;_count++){
         (function call(f){
           f(function _succ(){
@@ -53,7 +56,8 @@ function queue(msr,end){
                 _srs++;
                 if(_srs > msr)_srs = msr;
               }
-              run();
+
+              return run();
             }
           },function _err(){
             _count--;
@@ -67,14 +71,14 @@ function queue(msr,end){
                 _srs++;
                 if(_srs > msr)_srs = msr;
               }
-              run();
+
+              return run();
             }
           })
         })(_q.pop());
-      }
-    }else if(_q.length == 0){
-      end();
+      }return true;
     }
+    return false;
   }
 
 }
@@ -84,9 +88,10 @@ function connect(cb){
     if(err != null) throw err;
     if(db != null){
         db.on('error',function(e){
-          console.log('Erro de Banco')
+          logger.info('Erro de Banco')
         })
         cb(db,function(){
+          logger.info('closing...')
           db.close();
         });
     }
@@ -97,46 +102,32 @@ function request(base,url,succ,err,redir,maxRedir){
   err = typeof err == 'function' && err || function(res){
     throw res.statusCode + ' ' + res.statusMessage ;
   }
-  console.log('request '+ url);
+  logger.info('request '+ url);
   maxRedir = Number(maxRedir) || 10;
   redir = Number(redir) || 0;
   var proto = url.match(/https:.*/)?https:http;
-  try{
-    proto.get(url,function(res){
-      if(res.statusCode === 200)succ(res);
-      else if(res.statusCode > 300 && res.statusCode < 400 && res.headers && res.headers.location && redir < maxRedir){
-        if(res.headers.location.indexOf('/') == 0){
-          var parsed = urlp.parse(base);
-          request(base,parsed.protocol + '//' + parsed.host + res.headers.location,succ,err,redir + 1,maxRedir);
-        }else if(res.headers.location.indexOf(base) == 0)
-          request(base,res.headers.location,succ,err,redir + 1,maxRedir);
-      }
-    }).on('error',function(e){
-      console.log(e);
-      succ();
-    });
-  }catch(exc){
-    console.log(exc);
-    succ();
-  }
-
-}
-
-function parseText(text,stats,dict){
-    stats = stats || {}
-    var words = text.split(" ");
-    var rg = new RegExp('['+dict+']+','g');
-    for(let w of words){
-      var matches =  w.toLowerCase().match(rg);
-      if(matches)
-        for(let m of matches)
-          stats[m] = stats.hasOwnProperty(m)?stats[m] + 1:1;
+  proto.get(url,function(res){
+    if(res.statusCode === 200)succ(res);
+    else if(res.statusCode > 300 && res.statusCode < 400 && res.headers && res.headers.location && redir < maxRedir){
+      if(res.headers.location.indexOf('/') == 0){
+        var parsed = urlp.parse(base);
+        request(base,parsed.protocol + '//' + parsed.host + res.headers.location,succ,err,redir + 1,maxRedir);
+      }else if(res.headers.location.indexOf(base) == 0)
+        request(base,res.headers.location,succ,err,redir + 1,maxRedir);
     }
-    return stats;
+  }).on('error',function(e){
+    logger.warn(e);
+
+    if(e.code == "ECONNRESET")
+      err();
+    else {
+      succ();
+    }
+  });
 }
 
-function scrape(base,db,q,url,dict,s,e){
-  console.log('scrape ' + url);
+function scrape(base,db,q,url,abc,s,e,end){
+  logger.info('scrape ' + url);
   var urls = []
   var stats = {};
   request(base,url,function(res){
@@ -145,7 +136,17 @@ function scrape(base,db,q,url,dict,s,e){
       return;
     }
     var parser = new htmlparser.Parser({
-      ontext: function(text){stats = parseText(text,stats,dict)},
+      ontext: function parseText(text){
+          var words = text.split(" ");
+          var rg = new RegExp('['+abc+']+','g');
+          for(let w of words){
+            var matches =  w.toLowerCase().match(rg);
+            if(matches)
+              for(let m of matches)
+                stats[m] = stats.hasOwnProperty(m)?stats[m] + 1:1;
+          }
+          return stats;
+      },
       onopentag: function(tag,attr){
         if(attr.hasOwnProperty('href')){
             var purl = urlp.resolve(base,attr.href);
@@ -157,19 +158,24 @@ function scrape(base,db,q,url,dict,s,e){
 
     res.on('data',function(data){parser.write(data); }).on('end',function(){
       parser.end();
-      console.log('parsed ' + url);
+      logger.info('parsed ' + url);
       db.collection('urls').updateOne({'url':url},{$set: {'urls':urls}},{upsert:true},function(err,r){
-        if(err)throw err;
+        if(err){
+          console.log(e)
+          return e();
+        }
         let blk = db.collection('words').initializeOrderedBulkOp();
         for(let w in stats){
           blk.find({'w':w}).upsert().updateOne({$inc:{'count':stats[w]}})
         }
         blk.execute(function(err,r){
-          if(err) throw err;
-          s();
-          for(let url of urls){
-            check(base,db,q,url);
+          if(err){
+            console.log(e)
+            return e();
           }
+
+          check(base,db,q,urls,end,abc);
+          s();
         })
 
       });
@@ -178,62 +184,42 @@ function scrape(base,db,q,url,dict,s,e){
   },e);
 }
 
-function check(base,db,q,url,dict){
-  url = url || base;
-  console.log('check ' + url + ' with base ' + base);
-  db.collection('urls').find({'url':url}).limit(1).each(function(err,o){
+function check(base,db,q,urls,end,abc){
+  urls = urls || [base];
+  db.collection('urls').find({'url':{$in : urls}}).each(function(err,furl){
     if(err) throw err;
-    if(o != null && o.urls){
-      db.collection('urls').find({'url':{$in : o.urls}},function(err,urls){
-        if(err) throw err;
-        if(urls.length == o.urls.length)cb(db);
-        else {
-          for(let url of o.urls){
-            var found = false;
-            for(let ourl in urls){
-              if(ourl == url){
-                found = true;
-                break;
-              }
-            }
-            if(!found) q.enqueue(
-              function(succ,err){
-                scrape(base,db,q,url,dict,succ,err)
-              }
-            );
+    if(furl != null){
+      urls.splice(urls.indexOf(furl),1);
+    } else {
+      for(let url of urls)
+        q.enqueue(
+          function(succ,err){
+            scrape(base,db,q,url,abc,succ,err,end)
           }
-        }
-      });
-    }else {
-      q.enqueue(
-        function(succ,err){
-          scrape(base,db,q,url,dict,succ,err)
-        }
-      );
+        );
     }
   });
 }
 
 
 connect(function(db,close){
-  check('http://wol.jw.org/ht',db,new queue(100,function(){
-      db.collection('words').find().sort([['count', -1]]).limit(800)
+  check('http://wol.jw.org/ht',db,new queue(100),null,function(){
+      db.collection('words').find().sort({'count': -1}).limit(800)
         .toArray(function(err,docs){
-          console.log(docs);
+          logger.info(arguments);
           close();
         });
-      }),null,dict);
-
+      },abc);
 });
 /*
 var q = new queue(5,function(){
-  console.log('Finish');
+  logger.info('Finish');
 });
 q.pause();
 for(let j = 0;j< 10;j++){
   (function a(j){
     q.enqueue(function(s,e){
-      console.log('get '+j)
+      logger.info('get '+j)
       request('http://www.jw.org','http://www.jw.org'+(j % 3 == 0?j:'') ,s,e);
     })
   })(j);
