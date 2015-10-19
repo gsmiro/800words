@@ -13,8 +13,7 @@
   "dependencies":{
     "htmlparser2":">=3.7.2",
     "mongodb":">=1.4.7",
-    "node-schedule":">=0.1.13",
-    "mustache":">=0.8.2"
+    "bunyan":">=1.5.1"
    },
   "repository":{
       "url":"git@github.com:gsmiro/800words.git",
