@@ -1,16 +1,26 @@
 "use strict"
 var htmlparser = require('htmlparser2');
 var fs = require('fs');
+var crypto = require('crypto');
 var mongo = require('mongodb').MongoClient;
 var urlp = require('url');
 var http = require('http');
 var https = require('https');
 var logger = new (require('bunyan'))({
-  name: '800w'
+  name: '800w',
+  streams: [
+    {
+      stream:process.stdout,
+      level:'info'
+    },
+    {
+      path:'800w.log',
+      level:'trace'
+    }
+  ]
 });
 
 var mongourl = 'mongodb://localhost:27017/800w';
-var abc = 'abcdeèfgijklmnoòprstuvwyz';
 
 function queue(msr,end){
   var _q = [];
@@ -22,24 +32,27 @@ function queue(msr,end){
   this.stop = function stop_queue(){
     _self.state = 'stopped';
     _q = []
+    logger.trace(`stop state:${_self.state} srs:${_srs} length:'${_q.length } pending: ${ _pending}` );
   }
 
   this.pause = function pause_queue(){
     _self.state = 'paused';
+    logger.trace(`pause state:${_self.state} srs:${_srs} length:'${_q.length } pending: ${ _pending}` );
   }
 
   this.resume = function resume_queue(){
     _self.state = 'running';
-    logger.info('resume');
+    logger.trace(`resume state:${_self.state} srs:${_srs} length:'${_q.length } pending: ${ _pending}` );
     return run();
   }
 
   this.enqueue = function(f){
     _q.push(f);
+    logger.trace(`enqueue state:${_self.state} srs:${_srs} length:'${_q.length } pending: ${ _pending}` );
   }
 
   function run(){
-    logger.info(`state:${_self.state} srs:${_srs} length:'${_q.length } pending: ${ _pending}` );
+    logger.debug(`state:${_self.state} srs:${_srs} length:${_q.length } pending: ${ _pending}` );
     if(_self.state == 'running' && _q.length && _pending <= _srs){
       for(;_pending < _srs && _q.length;_pending++){
         (function call(f){
@@ -51,7 +64,7 @@ function queue(msr,end){
                 _srs = 1;
               }else if(_fail == 0){
                 _srs++;
-                if(_srs > msr)_srs = msr;
+                //if(_srs > msr)_srs = msr;
               }
               return run();
             }
@@ -65,16 +78,16 @@ function queue(msr,end){
                 _srs = 1;
               }else if(_fail == 0){
                 _srs++;
-                if(_srs > msr)_srs = msr;
+                //if(_srs > msr)_srs = msr;
               }
 
               return run();
             }
           })
-        })(_q.pop());
+        })(_q.shift());
       }return true;
     } else if(_q.length == 0 && _pending == 0)end();
-    else logger.info(`${ _self.state} ${_q.length} ${_pending}`);
+      else logger.warn(`still running ${ _self.state} ${_q.length} ${_pending}`);
     return false;
   }
 
@@ -85,10 +98,9 @@ function connect(cb){
     if(err != null) throw err;
     if(db != null){
         db.on('error',function(e){
-          logger.info('Erro de Banco')
+          logger.error('Cannot connect to database')
         })
         cb(db,function(){
-          logger.info('closing...')
           db.close();
         });
     }
@@ -116,7 +128,7 @@ function request(base,url,succ,err,maxRetry,maxRedir){
         retry = 0;
         var rurl = urlp.resolve(base,res.headers.location);
         if(rurl.indexOf(base) == 0){
-          logger.info('redirect '+ url + ' to ' + rurl + ' redir:'+ redir + ' maxRedir:'+maxRedir + ' retry:'+retry +' maxRetry:'+maxRetry);
+          logger.debug('redirect '+ url + ' to ' + rurl + ' redir:'+ redir + ' maxRedir:'+maxRedir + ' retry:'+retry +' maxRetry:'+maxRetry);
           _r(base,rurl);
         }
       } else if(maxRedir == redir){
@@ -127,12 +139,12 @@ function request(base,url,succ,err,maxRetry,maxRedir){
     }).on('error',function(e){
       if(e.code == 'ECONNRESET' && retry < maxRetry){
         retry++;
-        logger.info('retry redir:'+ redir + ' maxRedir:'+maxRedir + ' retry:'+retry +' maxRetry:'+maxRetry);
+        logger.debug('retry redir:'+ redir + ' maxRedir:'+maxRedir + ' retry:'+retry +' maxRetry:'+maxRetry);
         _r(base,url);
       }else err(e,redir,retry);
     });
   }
-  logger.info('request '+ url +' redir:'+ redir + ' maxRedir:'+maxRedir + ' retry:'+retry +' maxRetry:'+maxRetry);
+  logger.trace('request '+ url +' redir:'+ redir + ' maxRedir:'+maxRedir + ' retry:'+retry +' maxRetry:'+maxRetry);
   _r(base,url);
 
 }
@@ -141,18 +153,22 @@ function scrape(base,db,q,url,abc,s,e){
   logger.info(`scrape ${base} ${url}`);
   var urls = []
   var stats = {};
+  var _alphabet = abc.alphabet? new RegExp(`^[${abc.alphabet}]+$`,'g'): new RegExp('.+');
+  var _lang = abc.lang?new RegExp(abc.lang): new RegExp(/.*/);
+  var _accept = typeof abc.accepturl === 'function'? abc.accepturl:function(url){return url.indexOf(base) == 0;};
   request(base,url,function(res){
     if(res == null){
       s();
       return;
     }
+    var hash = crypto.createHash('sha256');
     var parser = new htmlparser.Parser({
       ontext: function parseText(text){
         if(this.parseText){
+          hash.update(text);
           var words = text.split(" ");
-          var rg = new RegExp(`^[${abc}]+$`,'g');
           for(let w of words){
-            var matches =  w.toLowerCase().match(rg);
+            var matches =  w.toLowerCase().match(_alphabet);
             if(matches)
               for(let m of matches)
                 stats[m] = stats.hasOwnProperty(m)?stats[m] + 1:1;
@@ -161,34 +177,58 @@ function scrape(base,db,q,url,abc,s,e){
         return stats;
       },
       onopentag: function(tag,attr){
-        if(attr.hasOwnProperty('href')){
-            this.parseText = false;
-            var purl = urlp.resolve(base,attr.href);
-            if(purl.indexOf(base) == 0)
-              urls = urls.concat(purl);
-        }else this.parseText = true;
+        if(tag === 'html')this.langParse = _lang.test(attr.lang || '');
+        else if(this.langParse){
+          if(attr.href){
+              this.parseText = false;
+              var purl = urlp.resolve(base,attr.href);
+              var htag = purl.indexOf('#')
+              if(htag > 0)purl = purl.substring(0,htag);
+              if(purl != base && _accept(purl))
+                urls = urls.concat(purl);
+              else logger.trace(`Ignoring ${base} ${purl}`)
+          }else this.parseText = true
+        }
       }
     }, {decodeEntities: true});
 
     res.on('data',function(data){parser.write(data); }).on('end',function(){
       parser.end();
-      logger.info(`parsed ${base} ${url}`);
-      db.collection('urls').updateOne({'url':url},{$set: {'urls':urls}},{upsert:true},function(err,r){
-        if(err) throw err;
-        logger.info(`updated ${base} ${url}`);
-        let blk = db.collection('words').initializeOrderedBulkOp();
-        var exec = false;
-        for(let w in stats){
-          blk.find({'w':w}).upsert().updateOne({$inc:{'count':stats[w]}})
-          exec = true;
+      var pagehash = hash.digest('hex');
+
+      logger.trace(`finished parsing ${base} ${url} ${pagehash}`);
+
+      db.collection('urls').findOneAndUpdate(
+        {hash:pagehash},
+        {
+          $set:{url:url},
+          $addToSet: {urls:{$each: urls}}
+        },
+        {upsert:true},
+        function(err,r){
+          if(err) throw err;
+          if(r.value == null){
+            // only process urls for a page which content was not processed before
+            logger.info(`update stats ${base} ${url} ${pagehash}`);
+            let blk = db.collection('words').initializeOrderedBulkOp();
+            var exec = false;
+            for(let w in stats){
+              blk.find({w:w}).upsert().updateOne({$inc:{count:stats[w]}})
+              exec = true;
+            }
+            if(exec)
+              blk.execute(function(err,res){
+                if(err) throw err;
+                  check(base,db,q,abc,urls,s);
+              })
+            else s();
+          }else{
+             logger.trace(`found hash for ${base} ${url} ${pagehash}`);
+             s();
+          }
+
         }
-        if(exec)
-          blk.execute(function(err,r){
-            if(err) throw err;
-            logger.info(`upsert ${base} ${url.length}`);
-            check(base,db,q,abc,urls,s);
-          })
-      });
+      );
 
     })
   },function(err){
@@ -198,42 +238,75 @@ function scrape(base,db,q,url,abc,s,e){
 
 function check(base,db,q,abc,urls,after){
   urls = urls || [base];
-  db.collection('urls').find({'url':{$in : urls}}).each(function(err,o){
-    if(err) throw err;
-    var furl = o && o.url
-    if(furl != null){
-      let idx =  urls.indexOf(furl);
-      if(idx >= 0){
-        urls.splice(urls.indexOf(furl),1);
-      }
-    } else {
-      for(let url of urls){
-        //logger.info(`check ${base} ${url} ${urls.length}`);
-        q.enqueue(
-          function(succ,err){
-            scrape(base,db,q,url,abc,succ,err)
+  logger.trace(`check base:${base} urls:${urls.length}`);
+  var col = db.collection('urls')
+  var blk = col.initializeOrderedBulkOp();
+  for(let url of urls){
+    blk.find({url:url}).upsert().updateOne({$set:{time:new Date()}});
+  }
+  blk.execute(function(err,r){
+      if(err)throw err;
+      logger.trace(`check updated to pending ${r.getUpsertedIds()}`);
+      col.find({url:{$in:urls},status:{$ne:'checking'}}).toArray(function(err,items){
+        if(err)throw err;
+        logger.trace(`check found ${items.length}`);
+        var lnt = items.length
+        var checking = false;
+        var enqueue = false;
+        if(lnt){
+          for(let u of items){
+            col.findOneAndUpdate({_id:u._id},{$set:{status:'checking',time:new Date()}},function(err,r){
+              if(err)throw err;
+              r = r.value
+              logger.trace(`check base:${base} url:${r.url} hash:${r.hash} proc:${lnt}`);
+              if(r.hash){//already parsed
+                if(r.urls && r.urls.length){
+                  check(base,db,q,abc,r.urls,after);
+                  checking = true;
+                }
+              }else{
+                q.enqueue(function(succ,err){
+                  scrape(base,db,q,r.url,abc,succ,err)
+                })
+                enqueue = true;
+              }
+              lnt--;
+              if(lnt == 0){
+                if(!checking && typeof after === 'function'){
+                  logger.trace(`check call after base:${base} url:${r.url} hash:${r.hash} proc:${lnt}`);
+                  after();
+                }
+                if(enqueue){
+                  logger.trace(`check resume queue base:${base} url:${r.url} hash:${r.hash} proc:${lnt}`);
+                  q.resume();
+                }
+              }
+            });
           }
-        );
-      }
-      if(typeof after == 'function'){
-        logger.info(`call after ${base} ${urls.length}`);
-        after();
-      }
-      q.resume();
+        }else if(typeof after === 'function'){
+          logger.trace(`check call after base:${base} url:${r.url} hash:${r.hash} proc:${lnt}`);
+          after();
+        }
+      });
     }
-  });
+  )
 }
 
 
 connect(function(db,close){
-  check('http://wol.jw.org/ht',db,new queue(100,function(){
-      db.collection('words').find().sort({'count': -1}).limit(800)
-        .toArray(function(err,docs){
-          if(err) throw err;
-          logger.info(arguments);
-          close();
-        });
-      }),abc);
+  db.collection('urls').updateMany({},{$set:{status:null,time:new Date()}},function(err,r){
+    if(err)throw err;
+    check('http://www.jw.org/ht',db,new queue(100,function(){
+        db.collection('words').find({stop:{$eq:false}}).sort({'count': -1}).limit(800)
+          .toArray(function(err,docs){
+            if(err) throw err;
+            logger.info(docs);
+            close();
+          });
+        }),{lang:'ht',alphabet:'abcdeèfgijklmnoòprstuvwyz',accepturl:function(url){
+          return url.indexOf('http://www.jw.org/ht') == 0 || url.indexOf('http://wol.jw.org/ht') == 0
+        }});
+  })
 });
 
 
