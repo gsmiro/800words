@@ -22,73 +22,110 @@ var logger = new (require('bunyan'))({
 
 var mongourl = 'mongodb://localhost:27017/800w';
 
-function queue(msr,end){
-  var _q = [];
+function MongoBackend(db,opts){
+  var _col = opts && opts.collection || 'queue'
+
+  function _q(f,v){
+    let _q = {};
+    _q[f] = v;
+    return _q;
+  }
+
+  function _shnd(it){};
+  function _ehnd(err){ throw err; };
+
+  this.enqueue = function(item,sh,eh){
+    var _sh = typeof sh === 'function'?sh:_shnd;
+    var _eh = typeof eh === 'function'?eh:_ehnd;
+    item = typeof item === 'object' && typeof item.length === 'number'?item:[item];
+    var _item = [];
+    for(let i of item){
+      logger.trace(i)
+      if(typeof i == 'string' || typeof i == 'number')
+        _item.push({_id:i});
+      else
+        _item.push(i);
+    }
+    db.collection(_col).insertMany(
+      _item,
+      function(err,res){
+        if(err)_eh(err)
+        _sh(res.ops);
+      }
+    )
+  }
+  this.stop = function(sh,eh){
+    var _sh = typeof sh === 'function'?sh:_shnd;
+    var _eh = typeof eh === 'function'?eh:_ehnd;
+    db.collection(_col).remove({},function(err,res){
+      if(err)_eh(err);
+      _sh(res.result);
+    })
+  }
+  this.request = function(num,func,eh){
+    let col = db.collection(_col);
+    var _eh = typeof eh === 'function'?eh:_ehnd;
+    col.find({}).limit(num).toArray(function(err,items){
+      if(err)_eh(err);
+      let ids = [];
+      for(let it of items)ids.push(it._id);
+      col.remove({_id:{$in:ids}},function(err,res){
+        if(err)_eh(err);
+        for(let it of items){
+          func(it._id);
+        }
+      })
+    });
+  }
+}
+
+function Queue(msr,bck,f,end){
   this.state = 'running'
   var _self = this;
   var _pending = 0;
-  var _fail = 0;
   var _srs = msr;
   this.stop = function stop_queue(){
-    _self.state = 'stopped';
-    _q = []
-    logger.trace(`stop state:${_self.state} srs:${_srs} length:'${_q.length } pending: ${ _pending}` );
+    bck.stop(function(r){
+      _self.state = 'stopped';
+      logger.trace(`stop state:${_self.state} srs:${_srs} pending:${ _pending}` );
+    })
   }
 
   this.pause = function pause_queue(){
     _self.state = 'paused';
-    logger.trace(`pause state:${_self.state} srs:${_srs} length:'${_q.length } pending: ${ _pending}` );
+    logger.trace(`pause state:${_self.state} srs:${_srs} pending:${ _pending}` );
   }
 
   this.resume = function resume_queue(){
     _self.state = 'running';
-    logger.trace(`resume state:${_self.state} srs:${_srs} length:'${_q.length } pending: ${ _pending}` );
+    logger.trace(`resume state:${_self.state} srs:${_srs} pending:${ _pending}` );
     return run();
   }
 
-  this.enqueue = function(f){
-    _q.push(f);
-    logger.trace(`enqueue state:${_self.state} srs:${_srs} length:'${_q.length } pending: ${ _pending}` );
+  this.enqueue = function(it){
+    bck.enqueue(it,function(ops){
+      logger.trace(`enqueued state:${_self.state} srs:${_srs} pending:${ _pending}` );
+    },function(err){
+      throw err;
+    })
+  }
+
+  function _suc(){
+    _pending--;
+    logger.trace(`success state:${_self.state} srs:${_srs} pending:${ _pending}`);
   }
 
   function run(){
-    logger.debug(`state:${_self.state} srs:${_srs} length:${_q.length } pending: ${ _pending}` );
-    if(_self.state == 'running' && _q.length && _pending <= _srs){
-      for(;_pending < _srs && _q.length;_pending++){
-        (function call(f){
-          f(function _succ(){
-            _pending--;
-            if(_pending == 0){
-              _srs = _srs - _fail;
-              if(_srs < 1){
-                _srs = 1;
-              }else if(_fail == 0){
-                _srs++;
-                //if(_srs > msr)_srs = msr;
-              }
-              return run();
-            }
-          },function _err(requeue){
-            _fail++;
-            if(requeue)_self.enqueue(f);
-            _pending--;
-            if(_pending == 0){
-              _srs = _srs - _fail;
-              if(_srs < 1){
-                _srs = 1;
-              }else if(_fail == 0){
-                _srs++;
-                //if(_srs > msr)_srs = msr;
-              }
-
-              return run();
-            }
-          })
-        })(_q.shift());
-      }return true;
-    } else if(_q.length == 0 && _pending == 0)end();
-      else logger.warn(`still running ${ _self.state} ${_q.length} ${_pending}`);
-    return false;
+    logger.debug(`state:${_self.state} srs:${_srs} pending:${ _pending}` );
+    if(_self.state == 'running' && _pending <= _srs){
+      bck.request(_srs - _pending,function(it){
+        f(it,_suc,function(requeue){
+          _pending--;
+          logger.trace(`fail state:${_self.state} srs:${_srs} pending:${ _pending} requeue:${requeue}`);
+          if(requeue)bck.enqueue(it);
+        });
+      });
+    } else logger.warn(`still running ${ _self.state} ${_pending}`);
   }
 
 }
@@ -149,14 +186,14 @@ function request(base,url,succ,err,maxRetry,maxRedir){
 
 }
 
-function scrape(base,db,q,url,abc,s,e){
-  logger.info(`scrape ${base} ${url}`);
+function scrape(url,db,q,abc,s,e){
+  logger.info(`scrape ${url}`);
   var urls = []
   var stats = {};
   var _alphabet = abc.alphabet? new RegExp(`^[${abc.alphabet}]+$`,'g'): new RegExp('.+');
   var _lang = abc.lang?new RegExp(abc.lang): new RegExp(/.*/);
-  var _accept = typeof abc.accepturl === 'function'? abc.accepturl:function(url){return url.indexOf(base) == 0;};
-  request(base,url,function(res){
+  var _accept = typeof abc.accepturl === 'function'? abc.accepturl:function(purl){return purl.indexOf(url) == 0;};
+  request(url,function(res){
     if(res == null){
       s();
       return;
@@ -181,12 +218,12 @@ function scrape(base,db,q,url,abc,s,e){
         else if(this.langParse){
           if(attr.href){
               this.parseText = false;
-              var purl = urlp.resolve(base,attr.href);
+              var purl = urlp.resolve(url,attr.href);
               var htag = purl.indexOf('#')
               if(htag > 0)purl = purl.substring(0,htag);
-              if(purl != base && _accept(purl))
+              if(purl != url && _accept(purl))
                 urls = urls.concat(purl);
-              else logger.trace(`Ignoring ${base} ${purl}`)
+              else logger.trace(`Ignoring ${purl}`)
           }else this.parseText = true
         }
       }
@@ -196,12 +233,11 @@ function scrape(base,db,q,url,abc,s,e){
       parser.end();
       var pagehash = hash.digest('hex');
 
-      logger.trace(`finished parsing ${base} ${url} ${pagehash}`);
+      logger.trace(`finished parsing ${url} ${pagehash}`);
 
       db.collection('urls').findOneAndUpdate(
         {hash:pagehash},
         {
-          $set:{url:url},
           $addToSet: {urls:{$each: urls}}
         },
         {upsert:true},
@@ -209,7 +245,7 @@ function scrape(base,db,q,url,abc,s,e){
           if(err) throw err;
           if(r.value == null){
             // only process urls for a page which content was not processed before
-            logger.info(`update stats ${base} ${url} ${pagehash}`);
+            logger.info(`update stats ${url} ${pagehash}`);
             let blk = db.collection('words').initializeOrderedBulkOp();
             var exec = false;
             for(let w in stats){
@@ -219,11 +255,11 @@ function scrape(base,db,q,url,abc,s,e){
             if(exec)
               blk.execute(function(err,res){
                 if(err) throw err;
-                  check(base,db,q,abc,urls,s);
+                  check(urls,db,q,abc,s);
               })
             else s();
           }else{
-             logger.trace(`found hash for ${base} ${url} ${pagehash}`);
+             logger.trace(`found hash for ${url} ${pagehash}`);
              s();
           }
 
@@ -236,18 +272,17 @@ function scrape(base,db,q,url,abc,s,e){
   });
 }
 
-function check(base,db,q,abc,urls,after){
-  urls = urls || [base];
-  logger.trace(`check base:${base} urls:${urls.length}`);
+function check(urls,db,q,abc,after){
+  logger.trace(`check urls:${urls.length}`);
   var col = db.collection('urls')
   var blk = col.initializeOrderedBulkOp();
   for(let url of urls){
-    blk.find({url:url}).upsert().updateOne({$set:{time:new Date()}});
+    blk.find({_id:url}).upsert().updateOne({$set:{time:new Date()}});
   }
   blk.execute(function(err,r){
       if(err)throw err;
       logger.trace(`check updated to pending ${r.getUpsertedIds()}`);
-      col.find({url:{$in:urls},status:{$ne:'checking'}}).toArray(function(err,items){
+      col.find({_id:{$in:urls},status:{$ne:'checking'}}).toArray(function(err,items){
         if(err)throw err;
         logger.trace(`check found ${items.length}`);
         var lnt = items.length
@@ -258,33 +293,31 @@ function check(base,db,q,abc,urls,after){
             col.findOneAndUpdate({_id:u._id},{$set:{status:'checking',time:new Date()}},function(err,r){
               if(err)throw err;
               r = r.value
-              logger.trace(`check base:${base} url:${r.url} hash:${r.hash} proc:${lnt}`);
+              logger.trace(`check url:${r.url} hash:${r.hash} proc:${lnt}`);
               if(r.hash){//already parsed
                 if(r.urls && r.urls.length){
-                  check(base,db,q,abc,r.urls,after);
+                  check(r.urls,db,q,abc,after);
                   checking = true;
                 }
               }else{
-                q.enqueue(function(succ,err){
-                  scrape(base,db,q,r.url,abc,succ,err)
-                })
+                q.enqueue(r);
                 enqueue = true;
               }
               lnt--;
               if(lnt == 0){
                 if(!checking && typeof after === 'function'){
-                  logger.trace(`check call after base:${base} url:${r.url} hash:${r.hash} proc:${lnt}`);
+                  logger.trace(`check call after  url:${r.url} hash:${r.hash} proc:${lnt}`);
                   after();
                 }
                 if(enqueue){
-                  logger.trace(`check resume queue base:${base} url:${r.url} hash:${r.hash} proc:${lnt}`);
+                  logger.trace(`check resume queue url:${r.url} hash:${r.hash} proc:${lnt}`);
                   q.resume();
                 }
               }
             });
           }
         }else if(typeof after === 'function'){
-          logger.trace(`check call after base:${base} url:${r.url} hash:${r.hash} proc:${lnt}`);
+          logger.trace(`check call after url:${r.url} hash:${r.hash} proc:${lnt}`);
           after();
         }
       });
@@ -296,16 +329,23 @@ function check(base,db,q,abc,urls,after){
 connect(function(db,close){
   db.collection('urls').updateMany({},{$set:{status:null,time:new Date()}},function(err,r){
     if(err)throw err;
-    check('http://www.jw.org/ht',db,new queue(100,function(){
-        db.collection('words').find({stop:{$eq:false}}).sort({'count': -1}).limit(800)
-          .toArray(function(err,docs){
-            if(err) throw err;
-            logger.info(docs);
-            close();
-          });
-        }),{lang:'ht',alphabet:'abcdeèfgijklmnoòprstuvwyz',accepturl:function(url){
-          return url.indexOf('http://www.jw.org/ht') == 0 || url.indexOf('http://wol.jw.org/ht') == 0
-        }});
+    var q = new Queue(100,new MongoBackend(db)
+    ,function(it,s,e){
+      check(url,db,q,{
+          lang:'ht',
+          alphabet:'abcdeèfgijklmnoòprstuvwyz'
+        },s,e)
+    }
+    ,function(){
+      db.collection('words').find({stop:{$eq:false}}).sort({'count': -1}).limit(800)
+      .toArray(function(err,docs){
+        if(err) throw err;
+        logger.info(docs);
+        close();
+      });
+    });
+    q.enqueue(['http://www.jw.org/ht','http://wol.jw.org/ht']);
+    q.resume();
   })
 });
 
