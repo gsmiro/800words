@@ -1,12 +1,14 @@
 "use strict"
-var htmlparser = require('htmlparser2');
-var fs = require('fs');
-var crypto = require('crypto');
-var mongo = require('mongodb').MongoClient;
-var urlp = require('url');
-var http = require('http');
-var https = require('https');
-var logger = new (require('bunyan'))({
+const util = require('util');
+const EventEmitter = require('events');
+const htmlparser = require('htmlparser2');
+const fs = require('fs');
+const crypto = require('crypto');
+const mongo = require('mongodb').MongoClient;
+const urlp = require('url');
+const http = require('http');
+const https = require('https');
+const logger = new (require('bunyan'))({
   name: '800w',
   streams: [
     {
@@ -20,10 +22,10 @@ var logger = new (require('bunyan'))({
   ]
 });
 
-var mongourl = 'mongodb://localhost:27017/800w';
+const mongourl = 'mongodb://localhost:27017/800w';
 
 function MongoBackend(db,opts){
-  var _col = opts && opts.collection || 'queue'
+  const _col = opts && opts.collection || 'queue'
 
   function _q(f,v){
     let _q = {};
@@ -34,29 +36,38 @@ function MongoBackend(db,opts){
   function _shnd(it){};
   function _ehnd(err){ throw err; };
 
+  const _self = this;
+
+  this.start = function(sh,eh){
+    let col = db.collection(_col);
+    const _eh = typeof eh === 'function'?eh:_ehnd;
+    db.collection(_col).remove({},function(err,res){
+      if(err)_eh(err);
+      sh(_self,res.result);
+    })
+  }
+
   this.enqueue = function(item,sh,eh){
-    var _sh = typeof sh === 'function'?sh:_shnd;
-    var _eh = typeof eh === 'function'?eh:_ehnd;
-    item = typeof item === 'object' && typeof item.length === 'number'?item:[item];
+    const _sh = typeof sh === 'function'?sh:_shnd;
+    const _eh = typeof eh === 'function'?eh:_ehnd;
     var _item = [];
     for(let i of item){
-      logger.trace(i)
-      if(typeof i == 'string' || typeof i == 'number')
-        _item.push({_id:i});
-      else
-        _item.push(i);
+      _item.push({o:i});
     }
     db.collection(_col).insertMany(
       _item,
       function(err,res){
         if(err)_eh(err)
-        _sh(res.ops);
+        for(let i of res.ops){
+          _sh(i.o);
+        }
+
       }
     )
   }
   this.stop = function(sh,eh){
-    var _sh = typeof sh === 'function'?sh:_shnd;
-    var _eh = typeof eh === 'function'?eh:_ehnd;
+    const _sh = typeof sh === 'function'?sh:_shnd;
+    const _eh = typeof eh === 'function'?eh:_ehnd;
     db.collection(_col).remove({},function(err,res){
       if(err)_eh(err);
       _sh(res.result);
@@ -64,72 +75,96 @@ function MongoBackend(db,opts){
   }
   this.request = function(num,func,eh){
     let col = db.collection(_col);
-    var _eh = typeof eh === 'function'?eh:_ehnd;
+    const _eh = typeof eh === 'function'?eh:_ehnd;
     col.find({}).limit(num).toArray(function(err,items){
       if(err)_eh(err);
       let ids = [];
       for(let it of items)ids.push(it._id);
-      col.remove({_id:{$in:ids}},function(err,res){
-        if(err)_eh(err);
-        for(let it of items){
-          func(it._id);
-        }
-      })
+      if(ids.length){
+        col.deleteMany({_id:{$in:ids}},function(err,res){
+          if(err)_eh(err);
+          for(let it of items){
+            func(it.o);
+          }
+        })
+      }else{
+
+      }
     });
   }
 }
 
-function Queue(msr,bck,f,end){
+function Queue(msr,bck,f){
+  EventEmitter.call(this);
   this.state = 'running'
-  var _self = this;
+  const _self = this;
   var _pending = 0;
   var _srs = msr;
   this.stop = function stop_queue(){
+
     bck.stop(function(r){
       _self.state = 'stopped';
+      _self.emit('stop',r);
       logger.trace(`stop state:${_self.state} srs:${_srs} pending:${ _pending}` );
     })
+
   }
 
   this.pause = function pause_queue(){
     _self.state = 'paused';
+    _self.emit('pause')
     logger.trace(`pause state:${_self.state} srs:${_srs} pending:${ _pending}` );
   }
 
   this.resume = function resume_queue(){
     _self.state = 'running';
     logger.trace(`resume state:${_self.state} srs:${_srs} pending:${ _pending}` );
+    _self.emit('resume');
     return run();
   }
 
   this.enqueue = function(it){
     bck.enqueue(it,function(ops){
-      logger.trace(`enqueued state:${_self.state} srs:${_srs} pending:${ _pending}` );
+      logger.trace(`enqueue state:${_self.state} srs:${_srs} pending:${ _pending}` );
+      _self.emit('enqueue',ops);
     },function(err){
       throw err;
     })
   }
 
-  function _suc(){
-    _pending--;
-    logger.trace(`success state:${_self.state} srs:${_srs} pending:${ _pending}`);
-  }
-
   function run(){
-    logger.debug(`state:${_self.state} srs:${_srs} pending:${ _pending}` );
-    if(_self.state == 'running' && _pending <= _srs){
-      bck.request(_srs - _pending,function(it){
-        f(it,_suc,function(requeue){
-          _pending--;
-          logger.trace(`fail state:${_self.state} srs:${_srs} pending:${ _pending} requeue:${requeue}`);
-          if(requeue)bck.enqueue(it);
-        });
+    logger.debug(`run state:${_self.state} srs:${_srs} pending:${ _pending}` );
+    if(_self.state == 'running'){
+      var req = _srs - _pending;
+      bck.request(req,function(it){
+        if(it === null){
+          run();
+          return;
+        }
+        if(_pending > _srs){
+          _self.enqueue([it]);
+        }else{
+          _pending++;
+          f(it,function(){
+            _pending--;
+            logger.trace(`success state:${_self.state} srs:${_srs} pending:${ _pending}`);
+            run();
+          },function(requeue){
+            _pending--;
+            logger.trace(`fail state:${_self.state} srs:${_srs} pending:${ _pending} requeue:${requeue}`);
+            if(requeue)_self.enqueue([it]);
+            run();
+          });
+        }
       });
-    } else logger.warn(`still running ${ _self.state} ${_pending}`);
+    } else logger.info(`paused queue ${ _self.state} ${_pending}`);
   }
+  bck.start(function(bck){
+    _self.emit('start',_self);
+  });
 
 }
-
+util.inherits(Queue,EventEmitter);
 function connect(cb){
   mongo.connect(mongourl,function(err,db){
     if(err != null) throw err;
@@ -144,29 +179,30 @@ function connect(cb){
   })
 }
 
-function request(base,url,succ,err,maxRetry,maxRedir){
+function request(url,acceptsurl,succ,err,maxRetry,maxRedir){
   err = typeof err == 'function' && err || function(res){
     throw res.statusCode + ' ' + res.statusMessage ;
   }
   maxRetry = Number(maxRetry) || 10;
-  var retry = Number(retry) || 0;
+  var retry = 0;
   maxRedir = Number(maxRedir) || 10;
-  var redir = Number(redir) || 0;
+  var redir = 0;
 
-  function _r(base,url){
+  function _r(url,acceptsurl){
+    logger.info('request '+ url +' redir:'+ redir + ' maxRedir:'+maxRedir + ' retry:'+retry +' maxRetry:'+maxRetry);
     var proto = url.match(/https:.*/)?https:http;
     proto.get(url,function(res){
       if(res.statusCode === 200)succ(res);
       else if(res.statusCode > 300
         && res.statusCode < 400 && res.headers && res.headers.location
         && redir < maxRedir && retry < maxRetry){
-
         redir++
         retry = 0;
-        var rurl = urlp.resolve(base,res.headers.location);
-        if(rurl.indexOf(base) == 0){
-          logger.debug('redirect '+ url + ' to ' + rurl + ' redir:'+ redir + ' maxRedir:'+maxRedir + ' retry:'+retry +' maxRetry:'+maxRetry);
-          _r(base,rurl);
+        var purl = urlp.parse(url);
+        var rurl = urlp.resolve(purl.host,res.headers.location);
+        if(acceptsurl(rurl)){
+          logger.debug(`redirect ${url} to ${rurl} redir:${redir} maxRedir:${maxRedir} retry:${retry} maxRetry:${maxRetry}`);
+          _r(rurl,acceptsurl);
         }
       } else if(maxRedir == redir){
         err('MAX_REDIR',redir,retry);
@@ -176,13 +212,12 @@ function request(base,url,succ,err,maxRetry,maxRedir){
     }).on('error',function(e){
       if(e.code == 'ECONNRESET' && retry < maxRetry){
         retry++;
-        logger.debug('retry redir:'+ redir + ' maxRedir:'+maxRedir + ' retry:'+retry +' maxRetry:'+maxRetry);
-        _r(base,url);
+        logger.debug(`retry url:${url} redir: ${redir} maxRedir: ${maxRedir} retry:${retry} maxRetry:${maxRetry}`);
+        _r(url,acceptsurl);
       }else err(e,redir,retry);
     });
   }
-  logger.trace('request '+ url +' redir:'+ redir + ' maxRedir:'+maxRedir + ' retry:'+retry +' maxRetry:'+maxRetry);
-  _r(base,url);
+  _r(url,acceptsurl);
 
 }
 
@@ -190,10 +225,11 @@ function scrape(url,db,q,abc,s,e){
   logger.info(`scrape ${url}`);
   var urls = []
   var stats = {};
-  var _alphabet = abc.alphabet? new RegExp(`^[${abc.alphabet}]+$`,'g'): new RegExp('.+');
-  var _lang = abc.lang?new RegExp(abc.lang): new RegExp(/.*/);
-  var _accept = typeof abc.accepturl === 'function'? abc.accepturl:function(purl){return purl.indexOf(url) == 0;};
-  request(url,function(res){
+  var nwords = 0;
+  const _alphabet = abc.alphabet? new RegExp(`^[${abc.alphabet}]+$`,'g'): new RegExp('.+');
+  const _lang = abc.lang?new RegExp(abc.lang): new RegExp(/.*/);
+  const _accept = typeof abc.accepturl === 'function'? abc.accepturl:function(purl){return purl.indexOf(url) == 0;};
+  request(url,_accept,function(res){
     if(res == null){
       s();
       return;
@@ -207,11 +243,17 @@ function scrape(url,db,q,abc,s,e){
           for(let w of words){
             var matches =  w.toLowerCase().match(_alphabet);
             if(matches)
-              for(let m of matches)
-                stats[m] = stats.hasOwnProperty(m)?stats[m] + 1:1;
+              for(let m of matches){
+                if(stats.hasOwnProperty(m)){
+                    stats[m]++
+                }else{
+                  nwords++;
+                  stats[m] = 1;
+                }
+
+              }
           }
         }
-        return stats;
       },
       onopentag: function(tag,attr){
         if(tag === 'html')this.langParse = _lang.test(attr.lang || '');
@@ -223,7 +265,6 @@ function scrape(url,db,q,abc,s,e){
               if(htag > 0)purl = purl.substring(0,htag);
               if(purl != url && _accept(purl))
                 urls = urls.concat(purl);
-              else logger.trace(`Ignoring ${purl}`)
           }else this.parseText = true
         }
       }
@@ -234,54 +275,58 @@ function scrape(url,db,q,abc,s,e){
       var pagehash = hash.digest('hex');
 
       logger.trace(`finished parsing ${url} ${pagehash}`);
-
-      db.collection('urls').findOneAndUpdate(
+      const col = db.collection('urls');
+      col.updateMany(
         {hash:pagehash},
-        {
-          $addToSet: {urls:{$each: urls}}
-        },
-        {upsert:true},
+        {$addToSet: {same:url}},
+        {multi:true},
         function(err,r){
           if(err) throw err;
-          if(r.value == null){
-            // only process urls for a page which content was not processed before
-            logger.info(`update stats ${url} ${pagehash}`);
-            let blk = db.collection('words').initializeOrderedBulkOp();
-            var exec = false;
-            for(let w in stats){
-              blk.find({w:w}).upsert().updateOne({$inc:{count:stats[w]}})
-              exec = true;
-            }
-            if(exec)
-              blk.execute(function(err,res){
-                if(err) throw err;
-                  check(urls,db,q,abc,s);
-              })
-            else s();
-          }else{
-             logger.trace(`found hash for ${url} ${pagehash}`);
-             s();
-          }
+          logger.trace(`found ${r.matchedCount} pages with hash ${pagehash}`)
+          const hashash = r.matchedCount
+          col.updateOne({_id:url},
+            {
+              $set:{hash:pagehash},
+              $addToSet: {urls:{$each: urls}}
+            },
+            function(err,r){
+              if(err)throw err;
+              if(nwords && !hashash && r.modifiedCount){
+                 // only process urls for a page which content was not processed before
 
+                   logger.info(`process words for ${url} ${pagehash}`);
+                   let blk = db.collection('words').initializeOrderedBulkOp();
+                   for(let w in stats){
+                     blk.find({_id:w}).upsert().updateOne({$inc:{count:stats[w]}})
+                   }
+                   blk.execute(function(err,res){
+                     if(err) throw err;
+                     check(urls,db,q);
+                     s();
+                   })
+              }else {
+                if(!r.matchedCount)logger.warn(`scraped url ${url} but not found it`)
+                s();
+              }
+            });
         }
       );
 
     })
-  },function(err){
+  },function(err,redir,retry){
+    logger.debug(err.statusCode?`${err.statusCode} ${url}`:err);
     e(false)
   });
 }
 
-function check(urls,db,q,abc,after){
-  logger.trace(`check urls:${urls.length}`);
-  var col = db.collection('urls')
+function check(urls,db,q,after){
+  const col = db.collection('urls')
   var blk = col.initializeOrderedBulkOp();
   for(let url of urls){
     blk.find({_id:url}).upsert().updateOne({$set:{time:new Date()}});
   }
   blk.execute(function(err,r){
       if(err)throw err;
-      logger.trace(`check updated to pending ${r.getUpsertedIds()}`);
       col.find({_id:{$in:urls},status:{$ne:'checking'}}).toArray(function(err,items){
         if(err)throw err;
         logger.trace(`check found ${items.length}`);
@@ -292,32 +337,35 @@ function check(urls,db,q,abc,after){
           for(let u of items){
             col.findOneAndUpdate({_id:u._id},{$set:{status:'checking',time:new Date()}},function(err,r){
               if(err)throw err;
+              logger.trace(r.value);
               r = r.value
-              logger.trace(`check url:${r.url} hash:${r.hash} proc:${lnt}`);
+              logger.info(`checking url:${r._id} hash:${r.hash}`)
               if(r.hash){//already parsed
                 if(r.urls && r.urls.length){
-                  check(r.urls,db,q,abc,after);
+                  check(r.urls,db,q,after);
                   checking = true;
                 }
               }else{
-                q.enqueue(r);
+                q.enqueue([r._id]);
                 enqueue = true;
               }
               lnt--;
               if(lnt == 0){
                 if(!checking && typeof after === 'function'){
-                  logger.trace(`check call after  url:${r.url} hash:${r.hash} proc:${lnt}`);
+                  logger.trace(`check call after url:${r.url} hash:${r.hash} proc:${lnt}`);
                   after();
                 }
                 if(enqueue){
-                  logger.trace(`check resume queue url:${r.url} hash:${r.hash} proc:${lnt}`);
+                  logger.trace(`check resume queue url:${r._d} hash:${r.hash} proc:${lnt}`);
                   q.resume();
                 }
               }
+
             });
           }
+
         }else if(typeof after === 'function'){
-          logger.trace(`check call after url:${r.url} hash:${r.hash} proc:${lnt}`);
+          logger.trace(`check call after`);
           after();
         }
       });
@@ -327,25 +375,27 @@ function check(urls,db,q,abc,after){
 
 
 connect(function(db,close){
+  const abc = {
+      lang:'ht',
+      alphabet:'abcdeèfgijklmnoòprstuvwyz',
+      accepturl:function(url){
+        return (url.indexOf('http://www.jw.org/ht') == 0
+          || url.indexOf('http://wol.jw.org/ht') == 0)
+          && url.indexOf('.gif') == -1
+          && url.indexOf('.jpeg') == -1
+          && url.indexOf('.jpg') == -1
+          ;
+      }
+    }
   db.collection('urls').updateMany({},{$set:{status:null,time:new Date()}},function(err,r){
     if(err)throw err;
     var q = new Queue(100,new MongoBackend(db)
     ,function(it,s,e){
-      check(url,db,q,{
-          lang:'ht',
-          alphabet:'abcdeèfgijklmnoòprstuvwyz'
-        },s,e)
-    }
-    ,function(){
-      db.collection('words').find({stop:{$eq:false}}).sort({'count': -1}).limit(800)
-      .toArray(function(err,docs){
-        if(err) throw err;
-        logger.info(docs);
-        close();
-      });
+      scrape(it,db,q,abc,s,e)
     });
-    q.enqueue(['http://www.jw.org/ht','http://wol.jw.org/ht']);
-    q.resume();
+    q.on('start',function(q){
+      check(['http://www.jw.org/ht','http://wol.jw.org/ht'],db,q);
+    });
   })
 });
 
