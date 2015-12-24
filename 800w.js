@@ -17,7 +17,7 @@ const logger = new (require('bunyan'))({
     },
     {
       path:'800w.log',
-      level:'trace'
+      level:'debug'
     }
   ]
 });
@@ -51,19 +51,21 @@ function MongoBackend(db,opts){
     const _sh = typeof sh === 'function'?sh:_shnd;
     const _eh = typeof eh === 'function'?eh:_ehnd;
     var _item = [];
-    for(let i of item){
-      _item.push({o:i});
-    }
-    db.collection(_col).insertMany(
-      _item,
-      function(err,res){
-        if(err)_eh(err)
-        for(let i of res.ops){
-          _sh(i.o);
-        }
-
+    if(item && item.length){
+      for(let i of item){
+        _item.push({o:i});
       }
-    )
+      db.collection(_col).insertMany(
+        _item,
+        function(err,res){
+          if(err)_eh(err)
+          for(let i of res.ops){
+            _sh(i.o);
+          }
+
+        }
+      )
+    }
   }
   this.stop = function(sh,eh){
     const _sh = typeof sh === 'function'?sh:_shnd;
@@ -94,12 +96,13 @@ function MongoBackend(db,opts){
   }
 }
 
-function Queue(msr,bck,f){
+function Queue(msr,bck,f,fact){
   EventEmitter.call(this);
   this.state = 'running'
   const _self = this;
   var _pending = 0;
   var _srs = msr;
+  const _fact = typeof fact == 'undefined' || 0.1;
   this.stop = function stop_queue(){
 
     bck.stop(function(r){
@@ -147,10 +150,14 @@ function Queue(msr,bck,f){
           _pending++;
           f(it,function(){
             _pending--;
+            _srs = _srs + _fact;
+            if(_srs > Number.MAX_VALUE)_srs = _srs = Number.MAX_VALUE;
             logger.trace(`success state:${_self.state} srs:${_srs} pending:${ _pending}`);
             run();
           },function(requeue){
             _pending--;
+            _srs = _srs - _fact;
+            if(_srs == 0)_srs = 1;
             logger.trace(`fail state:${_self.state} srs:${_srs} pending:${ _pending} requeue:${requeue}`);
             if(requeue)_self.enqueue([it]);
             run();
@@ -160,6 +167,7 @@ function Queue(msr,bck,f){
     } else logger.info(`paused queue ${ _self.state} ${_pending}`);
   }
   bck.start(function(bck){
+    logger.trace('backend started');
     _self.emit('start',_self);
   });
 
@@ -301,7 +309,9 @@ function scrape(url,db,q,abc,s,e){
                    }
                    blk.execute(function(err,res){
                      if(err) throw err;
-                     check(urls,db,q);
+                     logger.debug(`scraped and enqueue urls for ${url} ${pagehash}`);
+                     if(urls.length)
+                      q.enqueue(urls);
                      s();
                    })
               }else {
@@ -319,7 +329,7 @@ function scrape(url,db,q,abc,s,e){
   });
 }
 
-function check(urls,db,q,after){
+function check(urls,db,q,abc,s,e){
   const col = db.collection('urls')
   var blk = col.initializeOrderedBulkOp();
   for(let url of urls){
@@ -327,47 +337,35 @@ function check(urls,db,q,after){
   }
   blk.execute(function(err,r){
       if(err)throw err;
-      col.find({_id:{$in:urls},status:{$ne:'checking'}}).toArray(function(err,items){
+      col.find({_id:{$in:urls},status:{$ne:'check'}}).toArray(function(err,items){
         if(err)throw err;
         logger.trace(`check found ${items.length}`);
         var lnt = items.length
-        var checking = false;
         var enqueue = false;
         if(lnt){
           for(let u of items){
-            col.findOneAndUpdate({_id:u._id},{$set:{status:'checking',time:new Date()}},function(err,r){
+            col.findOneAndUpdate({_id:u._id},{$set:{status:'check',time:new Date()}},function(err,r){
               if(err)throw err;
               logger.trace(r.value);
               r = r.value
               logger.info(`checking url:${r._id} hash:${r.hash}`)
               if(r.hash){//already parsed
                 if(r.urls && r.urls.length){
-                  check(r.urls,db,q,after);
-                  checking = true;
+                  logger.debug(`checked and enqueue urls for url:${r._id} hash:${r.hash}`)
+                  q.enqueue(r.urls);
+                  enqueue = true;
                 }
               }else{
-                q.enqueue([r._id]);
-                enqueue = true;
+                scrape(r._id,db,q,abc,s,e);
               }
-              lnt--;
-              if(lnt == 0){
-                if(!checking && typeof after === 'function'){
-                  logger.trace(`check call after url:${r.url} hash:${r.hash} proc:${lnt}`);
-                  after();
-                }
-                if(enqueue){
-                  logger.trace(`check resume queue url:${r._d} hash:${r.hash} proc:${lnt}`);
-                  q.resume();
-                }
+              if(enqueue){
+                logger.trace(`check resume queue url:${r._d} hash:${r.hash} proc:${lnt}`);
+                q.resume();
               }
-
             });
           }
 
-        }else if(typeof after === 'function'){
-          logger.trace(`check call after`);
-          after();
-        }
+        }else s()
       });
     }
   )
@@ -384,17 +382,21 @@ connect(function(db,close){
           && url.indexOf('.gif') == -1
           && url.indexOf('.jpeg') == -1
           && url.indexOf('.jpg') == -1
+          && url.indexOf('choose-language') == -1;
           ;
       }
     }
   db.collection('urls').updateMany({},{$set:{status:null,time:new Date()}},function(err,r){
+    logger.info('cleaned urls');
     if(err)throw err;
     var q = new Queue(100,new MongoBackend(db)
     ,function(it,s,e){
-      scrape(it,db,q,abc,s,e)
-    });
+      check([it],db,q,abc,s,e)
+    },0);
     q.on('start',function(q){
-      check(['http://www.jw.org/ht','http://wol.jw.org/ht'],db,q);
+      logger.info('starting');
+      q.enqueue(['http://www.jw.org/ht','http://wol.jw.org/ht']);
+      q.resume();
     });
   })
 });
