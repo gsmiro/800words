@@ -383,7 +383,7 @@ function check(url,db,q,abc,s,e){
 connect(function(db,close){
   const abc = {
       lang:'ht',
-      alphabet:'abcdeèfgijklmnoòprstuvwyz',
+      alphabet:'abcdeèfghijklmnoòprstuvwyz',
       accepturl:function(url){
         return (url.indexOf('http://www.jw.org/ht') == 0
           || url.indexOf('http://wol.jw.org/ht') == 0)
